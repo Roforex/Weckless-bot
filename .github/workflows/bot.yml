@@ -1,0 +1,25 @@
+name: wickless-bot
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+concurrency: bot
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q yfinance pandas
+      - uses: actions/cache@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+      - run: python bot.py
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
