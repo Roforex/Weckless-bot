@@ -4,7 +4,8 @@ from zoneinfo import ZoneInfo
 import yfinance as yf, pandas as pd
 
 TICKER, RR, PIP, MIN_STOP = "AUDCHF=X", 2.0, 0.0001, 3
-TOKEN, CHAT = os.environ.get("TG_TOKEN", ""), os.environ.get("TG_CHAT", "")
+TOKEN, CHAT = "".join(os.environ.get("TG_TOKEN", "").split()), "".join(os.environ.get("TG_CHAT", "").split())
+
 STATE = "state/state.json"
 
 def send(msg):
