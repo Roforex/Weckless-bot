@@ -131,46 +131,56 @@ def main():
     # new pending orders
     auto = bool(OANDA_TOKEN and OANDA_ACC)
     for key, x in pend.items():
-        if key not in st["pending"]:
-            st["pending"][key] = {k: float(v) if k != "side" else v for k, v in x.items()}
-            if auto and busy_on_oanda():
-                st["pending"][key]["skipped"] = True
-                msgs.append(f"⏸ New level found but skipped ({local}): {key}\n"
-                            "An AUDCHF order or trade is already active on OANDA (max 1 at a time).")
-            elif auto:
-                oid, units, filled_now, r = place_order(x)
-                if oid:
-                    st["pending"][key]["oid"] = oid
-                    msgs.append(f"🤖 ORDER PLACED on OANDA ({local})\n" + order_text(x) +
-                                (f"\n(filled straight away)" if filled_now else ""))
-                else:
-                    msgs.append(f"⚠️ OANDA did NOT accept the order ({local})\n" + order_text(x) +
-                                f"\nReason: {r.get('detail') or r}")
+        entry = st["pending"].get(key)
+        if entry is not None and not entry.get("retry"):
+            continue                                   # already handled
+        if entry is None:
+            entry = st["pending"][key] = {k: float(v) if k != "side" else v for k, v in x.items()}
+        if not auto:
+            msgs.append(f"🔔 NEW ORDER ({local})\n" + order_text(x))
+        elif busy_on_oanda():
+            entry["skipped"] = True; entry.pop("retry", None)   # max 1 order/trade at a time (silent)
+        else:
+            oid, units, filled_now, r = place_order(x)
+            if oid:
+                entry["oid"] = oid
+                msgs.append(f"🤖 ORDER PLACED on OANDA ({local})" + (" - after retry" if entry.pop("retry", None) else "") +
+                            "\n" + order_text(x) + ("\n(filled straight away)" if filled_now else ""))
             else:
-                msgs.append(f"🔔 NEW ORDER ({local})\n" + order_text(x))
+                if not entry.get("retry"):
+                    msgs.append(f"⚠️ OANDA did NOT accept the order ({local}) - will retry every 5 min\n" +
+                                order_text(x) + f"\nReason: {r.get('detail') or r}")
+                entry["retry"] = True
     # pending orders that are no longer valid
     for key in list(st["pending"]):
         if key not in pend:
             filled = p is not None and f"{p['side']} {p['entry']:.5f}" == key
             oid = st["pending"][key].get("oid")
             if st["pending"][key].get("skipped"):
-                pass                # it was never placed, nothing to do
+                pass                # never placed (another order was active), nothing to do
+            elif filled and oid:
+                st.setdefault("live", []).append(p["time"])
+                msgs.append(f"✅ FILLED on OANDA ({local}): {key}\nTrade is open with its stop loss and take profit.")
+            elif filled and auto:
+                msgs.append(f"📝 Paper only ({local}): price reached {key}, but there was no OANDA order for it.")
             elif filled:
-                msgs.append(f"✅ FILLED ({local}): {key}\n" +
-                            ("Trade is open on OANDA with its stop loss and take profit." if oid else
-                             "Your order should now be open in MT5. Cancel any other pending orders."))
+                msgs.append(f"✅ FILLED ({local}): {key}\nYour order should now be open in MT5. Cancel any other pending orders.")
             elif oid:
-                cancel_order(oid)   # if OANDA already filled it, this does nothing and the trade keeps its SL/TP
-                msgs.append(f"❌ ORDER CANCELLED on OANDA ({local}): {key}")
+                r = cancel_order(oid)
+                if "error" in r and r.get("error") != 404:     # 404 = already filled/expired on OANDA -> fine
+                    msgs.append(f"⚠️ Could NOT cancel order {key} on OANDA ({local}).\n"
+                                f"Please delete it in the OANDA app.\nOANDA said: {r.get('error')} {r.get('detail')}")
+                else:
+                    msgs.append(f"❌ ORDER CANCELLED on OANDA ({local}): {key}")
+            elif st["pending"][key].get("retry"):
+                pass                # it was never placed on OANDA, nothing to do
             elif not first:
                 msgs.append(f"❌ CANCEL ORDER ({local}): {key}\nDelete this pending order in MT5.")
             del st["pending"][key]
     if p is not None and p["i"] >= RECENT and p["time"] not in st["trades"]:
         st["trades"].append(p["time"])
         key = f"{p['side']} {p['entry']:.5f}"
-        if not any(key in m for m in msgs) and not first and auto:
-            msgs.append(f"ℹ️ ({local}) Price hit {key} before an order was placed - no trade taken on OANDA.")
-        elif not any(key in m for m in msgs) and not first:
+        if not any(key in m for m in msgs) and not first and not auto:
             msgs.append(f"⚡ FAST TRADE ({local}): price hit a level before an alert could go out.\n"
                         f"{p['side']} {p['entry']:.5f} | SL {p['sl']:.5f} | TP {p['tp']:.5f}\nSkip it unless price is still near the entry.")
     # results of trades the bot took
@@ -179,8 +189,11 @@ def main():
             st["results"].append(t["time"])
             if t["time"] in st["trades"] or (t["x"] >= RECENT and not first):
                 icon = "🟢" if t["result"] == "WIN" else "🔴"
-                msgs.append(f"{icon} {t['result']} ({local}): {t['side']} from {t['entry']:.5f}\n"
-                            f"{'+' + str(RR) if t['result'] == 'WIN' else '-1'}R")
+                live = t["time"] in st.get("live", [])
+                tag = "on OANDA" if live else ("PAPER only, not on OANDA" if auto else "")
+                msgs.append(f"{icon} {t['result']} {tag} ({local}): {t['side']} from {t['entry']:.5f}\n"
+                            f"{'+' + str(RR) if t['result'] == 'WIN' else '-1'}R" +
+                            (" (bot's count - check OANDA for the exact amount)" if live else ""))
     if first:
         mode = "AUTO-TRADING on OANDA demo" if auto else "alerts only"
         msgs.insert(0, f"🤖 Bot started ({local}). Watching AUDCHF 5m - {mode}.\nPending orders right now: {len(pend)}")
@@ -192,9 +205,11 @@ def main():
         else:
             msgs.append(f"⚠️ Could not connect to OANDA.\nCheck OANDA_TOKEN and OANDA_ACCOUNT.\nOANDA said: {r.get('error')} {r.get('detail')}")
     st["trades"], st["results"] = st["trades"][-300:], st["results"][-300:]
+    st["live"] = st.get("live", [])[-300:]
     for m in msgs: send(m)
     os.makedirs("state", exist_ok=True)
     json.dump(st, open(STATE, "w"))
 
 if __name__ == "__main__":
     main()
+
