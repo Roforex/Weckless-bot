@@ -14,7 +14,8 @@ OANDA_TOKEN = "".join(os.environ.get("OANDA_TOKEN", "").split())
 OANDA_ACC = "".join(os.environ.get("OANDA_ACCOUNT", "").split())
 OANDA_URL = "https://api-fxpractice.oanda.com/v3"   # practice = demo money only
 RISK_CHF = 570         # money lost if the stop is hit: 570 CHF = about C$980 (1% of a 98k account)
-ORDER_HOURS = 8        # unfilled orders expire by themselves after this many hours
+ORDER_HOURS = 9        # unfilled orders expire by themselves after this many hours (safety net)
+MAX_WAITING = 3        # up to 3 limit orders can wait at once, but only 1 trade can be open
 
 def oanda(method, path, body=None):
     req = urllib.request.Request(OANDA_URL + path, method=method,
@@ -43,14 +44,14 @@ def place_order(x):
     filled_now = "orderFillTransaction" in r
     return oid, units, filled_now, r
 
-def busy_on_oanda():
-    """True if OANDA already has an AUD_CHF trade open or a limit order waiting (max 1 at a time)."""
+def oanda_status():
+    """(open AUD_CHF trades, ids of waiting AUD_CHF limit orders) - or None if OANDA can't be reached."""
     t = oanda("GET", f"/accounts/{OANDA_ACC}/openTrades")
     o = oanda("GET", f"/accounts/{OANDA_ACC}/pendingOrders")
-    if "error" in t or "error" in o: return True          # can't check -> play safe, don't add more
+    if "error" in t or "error" in o: return None
     trades = [x for x in t.get("trades", []) if x.get("instrument") == "AUD_CHF"]
-    limits = [x for x in o.get("orders", []) if x.get("instrument") == "AUD_CHF" and x.get("type") == "LIMIT"]
-    return bool(trades or limits)
+    waiting = {x["id"] for x in o.get("orders", []) if x.get("instrument") == "AUD_CHF" and x.get("type") == "LIMIT"}
+    return trades, waiting
 
 def cancel_order(oid):
     return oanda("PUT", f"/accounts/{OANDA_ACC}/orders/{oid}/cancel")
@@ -128,55 +129,80 @@ def main():
     RECENT = n - 12   # only care about things that happened in the last hour
     local = dt.datetime.now(ZoneInfo("America/St_Johns")).strftime("%a %H:%M")
     msgs = []
-    # new pending orders
     auto = bool(OANDA_TOKEN and OANDA_ACC)
-    for key, x in pend.items():
-        entry = st["pending"].get(key)
-        if entry is not None and not entry.get("retry"):
-            continue                                   # already handled
-        if entry is None:
-            entry = st["pending"][key] = {k: float(v) if k != "side" else v for k, v in x.items()}
-        if not auto:
-            msgs.append(f"🔔 NEW ORDER ({local})\n" + order_text(x))
-        elif busy_on_oanda():
-            entry["skipped"] = True; entry.pop("retry", None)   # max 1 order/trade at a time (silent)
-        else:
-            oid, units, filled_now, r = place_order(x)
-            if oid:
-                entry["oid"] = oid
-                msgs.append(f"🤖 ORDER PLACED on OANDA ({local})" + (" - after retry" if entry.pop("retry", None) else "") +
-                            "\n" + order_text(x) + ("\n(filled straight away)" if filled_now else ""))
-            else:
-                if not entry.get("retry"):
-                    msgs.append(f"⚠️ OANDA did NOT accept the order ({local}) - will retry every 5 min\n" +
-                                order_text(x) + f"\nReason: {r.get('detail') or r}")
-                entry["retry"] = True
-    # pending orders that are no longer valid
-    for key in list(st["pending"]):
-        if key not in pend:
-            filled = p is not None and f"{p['side']} {p['entry']:.5f}" == key
-            oid = st["pending"][key].get("oid")
-            if st["pending"][key].get("skipped"):
-                pass                # never placed (another order was active), nothing to do
-            elif filled and oid:
-                st.setdefault("live", []).append(p["time"])
-                msgs.append(f"✅ FILLED on OANDA ({local}): {key}\nTrade is open with its stop loss and take profit.")
-            elif filled and auto:
-                msgs.append(f"📝 Paper only ({local}): price reached {key}, but there was no OANDA order for it.")
-            elif filled:
-                msgs.append(f"✅ FILLED ({local}): {key}\nYour order should now be open in MT5. Cancel any other pending orders.")
-            elif oid:
-                r = cancel_order(oid)
-                if "error" in r and r.get("error") != 404:     # 404 = already filled/expired on OANDA -> fine
-                    msgs.append(f"⚠️ Could NOT cancel order {key} on OANDA ({local}).\n"
+    if auto:
+        status = oanda_status()
+        trades, waiting = status if status else ([], set())
+        mine = lambda: [(k, e) for k, e in st["pending"].items() if e.get("oid") and not e.get("filled")]
+        # 1) did any of our waiting orders fill on OANDA?
+        if status:
+            for k, e in mine():
+                if e["oid"] not in waiting:
+                    e["filled"] = True
+                    msgs.append(f"✅ FILLED on OANDA ({local}): {k}\nTrade is open with its stop loss and take profit.")
+        # 2) a trade is open -> cancel the other waiting orders (only 1 trade at a time)
+        if status and trades:
+            for k, e in mine():
+                if e["oid"] in waiting:
+                    cancel_order(e.pop("oid")); e["skipped"] = True
+                    msgs.append(f"❌ ORDER CANCELLED on OANDA ({local}): {k}\n(another trade is already open)")
+            ids = sorted(x["id"] for x in trades)
+            if len(trades) >= 2 and st.get("warn2") != ids:
+                st["warn2"] = ids
+                msgs.append(f"⚠️ {len(trades)} AUDCHF trades are open on OANDA at the same time ({local}).\n"
+                            "Price hit two levels within 5 minutes. Both have stop loss + take profit; "
+                            "you can close one in the OANDA app if you want.")
+        # 3) levels that are no longer valid
+        for k in [k for k in st["pending"] if k not in pend]:
+            e = st["pending"].pop(k)
+            if e.get("filled"):
+                if p is not None and f"{p['side']} {p['entry']:.5f}" == k:
+                    st.setdefault("live", []).append(p["time"])
+            elif e.get("oid"):
+                r = cancel_order(e["oid"])
+                if r.get("error") == 404:          # it filled in the last few minutes
+                    if p is not None and f"{p['side']} {p['entry']:.5f}" == k:
+                        st.setdefault("live", []).append(p["time"])
+                    msgs.append(f"✅ FILLED on OANDA ({local}): {k}\nTrade is open with its stop loss and take profit.")
+                elif "error" in r:
+                    msgs.append(f"⚠️ Could NOT cancel order {k} on OANDA ({local}).\n"
                                 f"Please delete it in the OANDA app.\nOANDA said: {r.get('error')} {r.get('detail')}")
                 else:
-                    msgs.append(f"❌ ORDER CANCELLED on OANDA ({local}): {key}")
-            elif st["pending"][key].get("retry"):
-                pass                # it was never placed on OANDA, nothing to do
+                    msgs.append(f"❌ ORDER CANCELLED on OANDA ({local}): {k}")
+        # 4) place new valid levels (max 3 waiting, none while a trade is open)
+        for k, x in pend.items():
+            e = st["pending"].get(k)
+            if e is not None and e.get("oid"):
+                continue                                   # already on OANDA
+            if e is None:
+                e = st["pending"][k] = {kk: float(v) if kk != "side" else v for kk, v in x.items()}
+            if not status or trades or len(mine()) >= MAX_WAITING:
+                e["skipped"] = True                        # try again next run (silent)
+                continue
+            oid, units, filled_now, r = place_order(x)
+            if oid:
+                e["oid"] = oid; e.pop("skipped", None)
+                msgs.append(f"🤖 ORDER PLACED on OANDA ({local})" + (" - after retry" if e.pop("retry", None) else "") +
+                            "\n" + order_text(x))
+                if filled_now:
+                    e["filled"] = True; trades = [1]
+                    msgs.append(f"✅ FILLED on OANDA ({local}): {k} (straight away)")
+            else:
+                if not e.get("retry"):
+                    msgs.append(f"⚠️ OANDA did NOT accept the order ({local}) - will retry every 5 min\n" +
+                                order_text(x) + f"\nReason: {r.get('detail') or r}")
+                e["retry"] = True
+    else:
+        for k, x in pend.items():
+            if k not in st["pending"]:
+                st["pending"][k] = {kk: float(v) if kk != "side" else v for kk, v in x.items()}
+                msgs.append(f"🔔 NEW ORDER ({local})\n" + order_text(x))
+        for k in [k for k in st["pending"] if k not in pend]:
+            st["pending"].pop(k)
+            if p is not None and f"{p['side']} {p['entry']:.5f}" == k:
+                msgs.append(f"✅ FILLED ({local}): {k}\nYour order should now be open in MT5. Cancel any other pending orders.")
             elif not first:
-                msgs.append(f"❌ CANCEL ORDER ({local}): {key}\nDelete this pending order in MT5.")
-            del st["pending"][key]
+                msgs.append(f"❌ CANCEL ORDER ({local}): {k}\nDelete this pending order in MT5.")
     if p is not None and p["i"] >= RECENT and p["time"] not in st["trades"]:
         st["trades"].append(p["time"])
         key = f"{p['side']} {p['entry']:.5f}"
@@ -212,4 +238,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
